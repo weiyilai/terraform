@@ -5,20 +5,33 @@ package moduletest
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/hcl/v2"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
+const (
+	MainStateIdentifier = ""
+)
+
 type Run struct {
 	Config *configs.TestRun
+
+	// ModuleConfig is a copy of the module configuration that the run is testing.
+	// The variables and provider configurations are copied so that the run can
+	// modify them safely without affecting the original configuration.
+	// However, any other fields in the module configuration are still shared between
+	// all runs that use the same module configuration.
+	ModuleConfig *configs.Config
 
 	Verbose *Verbose
 
@@ -27,6 +40,58 @@ type Run struct {
 	Status Status
 
 	Diagnostics tfdiags.Diagnostics
+
+	// ExecutionMeta captures metadata about how the test run was executed.
+	//
+	// This field is not always populated. A run that has never been executed
+	// will definitely have a nil value for this field. A run that was
+	// executed may or may not populate this field, depending on exactly what
+	// happened during the run execution. Callers accessing this field MUST
+	// check for nil and handle that case in some reasonable way.
+	//
+	// Executing the same run multiple times may or may not update this field
+	// on each execution.
+	ExecutionMeta *RunExecutionMeta
+}
+
+func NewRun(config *configs.TestRun, moduleConfig *configs.Config, index int) *Run {
+	// Make a copy the module configuration variables and provider configuration maps
+	// so that the run can modify the map safely.
+	newModuleConfig := *moduleConfig
+	if moduleConfig.Module != nil {
+		newModule := *moduleConfig.Module
+		newModule.Variables = make(map[string]*configs.Variable, len(moduleConfig.Module.Variables))
+		for name, variable := range moduleConfig.Module.Variables {
+			newModule.Variables[name] = variable
+		}
+		newModule.ProviderConfigs = make(map[string]*configs.Provider, len(moduleConfig.Module.ProviderConfigs))
+		for name, provider := range moduleConfig.Module.ProviderConfigs {
+			newModule.ProviderConfigs[name] = provider
+		}
+		newModuleConfig.Module = &newModule
+	}
+
+	return &Run{
+		Config:       config,
+		ModuleConfig: &newModuleConfig,
+		Name:         config.Name,
+		Index:        index,
+	}
+}
+
+type RunExecutionMeta struct {
+	Start    time.Time
+	Duration time.Duration
+}
+
+// StartTimestamp returns the start time metadata as a timestamp formatted as YYYY-MM-DDTHH:MM:SSZ.
+// Times are converted to UTC, if they aren't already.
+// If the start time is unset an empty string is returned.
+func (m *RunExecutionMeta) StartTimestamp() string {
+	if m.Start.IsZero() {
+		return ""
+	}
+	return m.Start.UTC().Format(time.RFC3339)
 }
 
 // Verbose is a utility struct that holds all the information required for a run
@@ -40,6 +105,10 @@ type Verbose struct {
 	Config       *configs.Config
 	Providers    map[addrs.Provider]providers.ProviderSchema
 	Provisioners map[string]*configschema.Block
+}
+
+func (run *Run) Addr() addrs.Run {
+	return addrs.Run{Name: run.Name}
 }
 
 func (run *Run) GetTargets() ([]addrs.Targetable, tfdiags.Diagnostics) {
@@ -90,14 +159,14 @@ func (run *Run) GetReferences() ([]*addrs.Reference, tfdiags.Diagnostics) {
 
 	for _, rule := range run.Config.CheckRules {
 		for _, variable := range rule.Condition.Variables() {
-			reference, diags := addrs.ParseRef(variable)
+			reference, diags := addrs.ParseRefFromTestingScope(variable)
 			diagnostics = diagnostics.Append(diags)
 			if reference != nil {
 				references = append(references, reference)
 			}
 		}
 		for _, variable := range rule.ErrorMessage.Variables() {
-			reference, diags := addrs.ParseRef(variable)
+			reference, diags := addrs.ParseRefFromTestingScope(variable)
 			diagnostics = diagnostics.Append(diags)
 			if reference != nil {
 				references = append(references, reference)
@@ -105,7 +174,154 @@ func (run *Run) GetReferences() ([]*addrs.Reference, tfdiags.Diagnostics) {
 		}
 	}
 
+	for _, expr := range run.Config.Variables {
+		moreRefs, moreDiags := langrefs.ReferencesInExpr(addrs.ParseRefFromTestingScope, expr)
+		diagnostics = diagnostics.Append(moreDiags)
+		references = append(references, moreRefs...)
+	}
+
 	return references, diagnostics
+}
+
+// GetStateKey returns the run's state key. If an explicit state key is set in
+// the run's configuration, that key is returned. Otherwise, if the run is using
+// an alternate module under test, the source of that module is returned as the
+// state key. If neither of these conditions are met, an empty string is
+// returned, and this denotes that the run is using the root module under test.
+func (run *Run) GetStateKey() string {
+	if run.Config.StateKey != "" {
+		return run.Config.StateKey
+	}
+
+	// The run has an alternate module under test, so we can use the module's source
+	if run.Config.ConfigUnderTest != nil {
+		return run.Config.Module.Source.String()
+	}
+
+	return MainStateIdentifier
+}
+
+// GetModuleConfigID returns the identifier for the module configuration that
+// this run is testing. This is used to uniquely identify the module
+// configuration in the test state.
+func (run *Run) GetModuleConfigID() string {
+	return run.ModuleConfig.Module.SourceDir
+}
+
+// ExplainExpectedFailures is similar to ValidateExpectedFailures except it
+// looks for any diagnostics produced by custom conditions and are included in
+// the expected failures and adds an additional explanation that clarifies the
+// expected failures are being ignored this time round.
+//
+// Generally, this function is used during an `apply` operation to explain that
+// an expected failure during the planning stage will still result in the
+// overall test failing as the plan failed and we couldn't even execute the
+// apply stage.
+func (run *Run) ExplainExpectedFailures(originals tfdiags.Diagnostics) tfdiags.Diagnostics {
+
+	// We're going to capture all the checkable objects that are referenced
+	// from the expected failures.
+	expectedFailures := addrs.MakeMap[addrs.Referenceable, bool]()
+	sourceRanges := addrs.MakeMap[addrs.Referenceable, tfdiags.SourceRange]()
+
+	for _, traversal := range run.Config.ExpectFailures {
+		// Ignore the diagnostics returned from the reference parsing, these
+		// references will have been checked earlier in the process by the
+		// validate stage so we don't need to do that again here.
+		reference, _ := addrs.ParseRefFromTestingScope(traversal)
+		expectedFailures.Put(reference.Subject, false)
+		sourceRanges.Put(reference.Subject, reference.SourceRange)
+	}
+
+	var diags tfdiags.Diagnostics
+	for _, diag := range originals {
+		if diag.Severity() == tfdiags.Warning {
+			// Then it's fine, the test will carry on without us doing anything.
+			diags = diags.Append(diag)
+			continue
+		}
+
+		if rule, ok := addrs.DiagnosticOriginatesFromCheckRule(diag); ok {
+
+			var rng *hcl.Range
+			expected := false
+			switch rule.Container.CheckableKind() {
+			case addrs.CheckableOutputValue:
+				addr := rule.Container.(addrs.AbsOutputValue)
+				if !addr.Module.IsRoot() {
+					// failures can only be expected against checkable objects
+					// in the root module. This diagnostic will be added into
+					// returned set below.
+					break
+				}
+				if expectedFailures.Has(addr.OutputValue) {
+					expected = true
+					rng = sourceRanges.Get(addr.OutputValue).ToHCL().Ptr()
+				}
+
+			case addrs.CheckableInputVariable:
+				addr := rule.Container.(addrs.AbsInputVariableInstance)
+				if !addr.Module.IsRoot() {
+					// failures can only be expected against checkable objects
+					// in the root module. This diagnostic will be added into
+					// returned set below.
+					break
+				}
+				if expectedFailures.Has(addr.Variable) {
+					expected = true
+				}
+
+			case addrs.CheckableResource:
+				addr := rule.Container.(addrs.AbsResourceInstance)
+				if !addr.Module.IsRoot() {
+					// failures can only be expected against checkable objects
+					// in the root module. This diagnostic will be added into
+					// returned set below.
+					break
+				}
+				if expectedFailures.Has(addr.Resource) {
+					expected = true
+				}
+
+				if expectedFailures.Has(addr.Resource.Resource) {
+					expected = true
+				}
+
+			case addrs.CheckableCheck:
+				// Check blocks only produce warnings so this branch shouldn't
+				// ever be triggered anyway.
+			default:
+				panic("unrecognized CheckableKind: " + rule.Container.CheckableKind().String())
+			}
+
+			if expected {
+				// Then this diagnostic was produced by a custom condition that
+				// was expected to fail. But, it happened at the wrong time (eg.
+				// we're trying to run an apply operation and this condition
+				// failed during the plan so the overall test operation still
+				// fails).
+				//
+				// We'll add a warning diagnostic explaining why the overall
+				// test is still failing even though the error was expected, and
+				// then add the original error into our diagnostics directly
+				// after.
+
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagWarning,
+					Summary:  "Expected failure while planning",
+					Detail:   fmt.Sprintf("A custom condition within %s failed during the planning stage and prevented the requested apply operation. While this was an expected failure, the apply operation could not be executed and so the overall test case will be marked as a failure and the original diagnostic included in the test report.", rule.Container.String()),
+					Subject:  rng,
+				})
+				diags = diags.Append(diag)
+				continue
+			}
+		}
+
+		// Otherwise, there is nothing special about this diagnostic so just
+		// carry it through.
+		diags = diags.Append(diag)
+	}
+	return diags
 }
 
 // ValidateExpectedFailures steps through the provided diagnostics (which should
@@ -332,9 +548,32 @@ func (run *Run) ValidateExpectedFailures(originals tfdiags.Diagnostics) tfdiags.
 				Summary:  "Missing expected failure",
 				Detail:   fmt.Sprintf("The checkable object, %s, was expected to report an error but did not.", addr.String()),
 				Subject:  sourceRanges.Get(addr).ToHCL().Ptr(),
+				Extra:    missingExpectedFailure(true),
 			})
 		}
 	}
 
 	return diags
+}
+
+// DiagnosticExtraFromMissingExpectedFailure provides an interface for diagnostic ExtraInfo to
+// denote that a diagnostic was generated as a result of a missing expected failure.
+type DiagnosticExtraFromMissingExpectedFailure interface {
+	DiagnosticFromMissingExpectedFailure() bool
+}
+
+// DiagnosticFromMissingExpectedFailure checks if the provided diagnostic
+// is a result of a missing expected failure.
+func DiagnosticFromMissingExpectedFailure(diag tfdiags.Diagnostic) bool {
+	maybe := tfdiags.ExtraInfo[DiagnosticExtraFromMissingExpectedFailure](diag)
+	if maybe == nil {
+		return false
+	}
+	return maybe.DiagnosticFromMissingExpectedFailure()
+}
+
+type missingExpectedFailure bool
+
+func (missingExpectedFailure) DiagnosticFromMissingExpectedFailure() bool {
+	return true
 }
