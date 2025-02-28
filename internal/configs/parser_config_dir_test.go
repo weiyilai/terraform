@@ -6,6 +6,7 @@ package configs
 import (
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -120,6 +121,7 @@ func TestParserLoadConfigDirWithTests(t *testing.T) {
 		"testdata/valid-modules/with-tests-nested",
 		"testdata/valid-modules/with-tests-very-nested",
 		"testdata/valid-modules/with-tests-json",
+		"testdata/valid-modules/with-mocks",
 	}
 
 	for _, directory := range directories {
@@ -142,6 +144,92 @@ func TestParserLoadConfigDirWithTests(t *testing.T) {
 			if len(mod.Tests) != 2 {
 				t.Errorf("incorrect number of test files found: %d", len(mod.Tests))
 			}
+		})
+	}
+}
+
+func TestParserLoadTestFiles_Invalid(t *testing.T) {
+
+	tcs := map[string][]string{
+		"duplicate_data_overrides": {
+			"duplicate_data_overrides.tftest.hcl:7,3-16: Duplicate override_data block; An override_data block targeting data.aws_instance.test has already been defined at duplicate_data_overrides.tftest.hcl:2,3-16.",
+			"duplicate_data_overrides.tftest.hcl:18,1-14: Duplicate override_data block; An override_data block targeting data.aws_instance.test has already been defined at duplicate_data_overrides.tftest.hcl:13,1-14.",
+			"duplicate_data_overrides.tftest.hcl:29,3-16: Duplicate override_data block; An override_data block targeting data.aws_instance.test has already been defined at duplicate_data_overrides.tftest.hcl:24,3-16.",
+		},
+		"duplicate_mixed_providers": {
+			"duplicate_mixed_providers.tftest.hcl:3,1-20: Duplicate provider block; A provider for aws is already defined at duplicate_mixed_providers.tftest.hcl:1,10-15.",
+			"duplicate_mixed_providers.tftest.hcl:9,1-20: Duplicate provider block; A provider for aws.test is already defined at duplicate_mixed_providers.tftest.hcl:5,10-15.",
+		},
+		"duplicate_mock_data_sources": {
+			"duplicate_mock_data_sources.tftest.hcl:7,13-27: Duplicate mock_data block; A mock_data block for aws_instance has already been defined at duplicate_mock_data_sources.tftest.hcl:3,3-27.",
+		},
+		"duplicate_mock_providers": {
+			"duplicate_mock_providers.tftest.hcl:3,1-20: Duplicate provider block; A provider for aws is already defined at duplicate_mock_providers.tftest.hcl:1,15-20.",
+			"duplicate_mock_providers.tftest.hcl:9,1-20: Duplicate provider block; A provider for aws.test is already defined at duplicate_mock_providers.tftest.hcl:5,15-20.",
+		},
+		"duplicate_mock_resources": {
+			"duplicate_mock_resources.tftest.hcl:7,17-31: Duplicate mock_resource block; A mock_resource block for aws_instance has already been defined at duplicate_mock_resources.tftest.hcl:3,3-31.",
+		},
+		"duplicate_module_overrides": {
+			"duplicate_module_overrides.tftest.hcl:7,1-16: Duplicate override_module block; An override_module block targeting module.child has already been defined at duplicate_module_overrides.tftest.hcl:2,1-16.",
+			"duplicate_module_overrides.tftest.hcl:18,3-18: Duplicate override_module block; An override_module block targeting module.child has already been defined at duplicate_module_overrides.tftest.hcl:13,3-18.",
+		},
+		"duplicate_providers": {
+			"duplicate_providers.tftest.hcl:3,1-15: Duplicate provider block; A provider for aws is already defined at duplicate_providers.tftest.hcl:1,10-15.",
+			"duplicate_providers.tftest.hcl:9,1-15: Duplicate provider block; A provider for aws.test is already defined at duplicate_providers.tftest.hcl:5,10-15.",
+		},
+		"duplicate_resource_overrides": {
+			"duplicate_resource_overrides.tftest.hcl:7,3-20: Duplicate override_resource block; An override_resource block targeting aws_instance.test has already been defined at duplicate_resource_overrides.tftest.hcl:2,3-20.",
+			"duplicate_resource_overrides.tftest.hcl:18,1-18: Duplicate override_resource block; An override_resource block targeting aws_instance.test has already been defined at duplicate_resource_overrides.tftest.hcl:13,1-18.",
+			"duplicate_resource_overrides.tftest.hcl:29,3-20: Duplicate override_resource block; An override_resource block targeting aws_instance.test has already been defined at duplicate_resource_overrides.tftest.hcl:24,3-20.",
+		},
+		"invalid_data_override": {
+			"invalid_data_override.tftest.hcl:6,1-14: Missing target attribute; override_data blocks must specify a target address.",
+		},
+		"invalid_data_override_target": {
+			"invalid_data_override_target.tftest.hcl:8,3-24: Invalid override target; You can only target data sources from override_data blocks, not module.child.",
+			"invalid_data_override_target.tftest.hcl:3,3-31: Invalid override target; You can only target data sources from override_data blocks, not aws_instance.target.",
+		},
+		"invalid_mock_data_sources": {
+			"invalid_mock_data_sources.tftest.hcl:7,13-16: Variables not allowed; Variables may not be used here.",
+		},
+		"invalid_mock_resources": {
+			"invalid_mock_resources.tftest.hcl:7,13-16: Variables not allowed; Variables may not be used here.",
+		},
+		"invalid_module_override": {
+			"invalid_module_override.tftest.hcl:5,1-16: Missing target attribute; override_module blocks must specify a target address.",
+			"invalid_module_override.tftest.hcl:11,3-9: Unsupported argument; An argument named \"values\" is not expected here.",
+		},
+		"invalid_module_override_target": {
+			"invalid_module_override_target.tftest.hcl:3,3-31: Invalid override target; You can only target modules from override_module blocks, not aws_instance.target.",
+			"invalid_module_override_target.tftest.hcl:8,3-36: Invalid override target; You can only target modules from override_module blocks, not data.aws_instance.target.",
+		},
+		"invalid_resource_override": {
+			"invalid_resource_override.tftest.hcl:6,1-18: Missing target attribute; override_resource blocks must specify a target address.",
+		},
+		"invalid_resource_override_target": {
+			"invalid_resource_override_target.tftest.hcl:3,3-36: Invalid override target; You can only target resources from override_resource blocks, not data.aws_instance.target.",
+			"invalid_resource_override_target.tftest.hcl:8,3-24: Invalid override target; You can only target resources from override_resource blocks, not module.child.",
+		},
+		"duplicate_file_config": {
+			"duplicate_file_config.tftest.hcl:3,1-5: Multiple \"test\" blocks; This test file already has a \"test\" block defined at duplicate_file_config.tftest.hcl:1,1-5.",
+			"duplicate_file_config.tftest.hcl:5,1-5: Multiple \"test\" blocks; This test file already has a \"test\" block defined at duplicate_file_config.tftest.hcl:1,1-5.",
+		},
+	}
+
+	for name, expected := range tcs {
+		t.Run(name, func(t *testing.T) {
+			src, err := os.ReadFile(fmt.Sprintf("testdata/invalid-test-files/%s.tftest.hcl", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			parser := testParser(map[string]string{
+				fmt.Sprintf("%s.tftest.hcl", name): string(src),
+			})
+
+			_, actual := parser.LoadTestFile(fmt.Sprintf("%s.tftest.hcl", name))
+			assertExactDiagnostics(t, actual, expected)
 		})
 	}
 }
@@ -195,7 +283,7 @@ func TestParserLoadConfigDirFailure(t *testing.T) {
 			parser := NewParser(nil)
 			path := filepath.Join("testdata/invalid-modules", name)
 
-			_, diags := parser.LoadConfigDir(path)
+			_, diags := parser.LoadConfigDirWithTests(path, "tests")
 			if !diags.HasErrors() {
 				t.Errorf("no errors; want at least one")
 				for _, diag := range diags {
@@ -237,7 +325,7 @@ func TestParserLoadConfigDirFailure(t *testing.T) {
 }
 
 func TestIsEmptyDir(t *testing.T) {
-	val, err := IsEmptyDir(filepath.Join("testdata", "valid-files"))
+	val, err := IsEmptyDir(filepath.Join("testdata", "valid-files"), "")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -247,7 +335,7 @@ func TestIsEmptyDir(t *testing.T) {
 }
 
 func TestIsEmptyDir_noExist(t *testing.T) {
-	val, err := IsEmptyDir(filepath.Join("testdata", "nopenopenope"))
+	val, err := IsEmptyDir(filepath.Join("testdata", "nopenopenope"), "")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -256,12 +344,35 @@ func TestIsEmptyDir_noExist(t *testing.T) {
 	}
 }
 
-func TestIsEmptyDir_noConfigs(t *testing.T) {
-	val, err := IsEmptyDir(filepath.Join("testdata", "dir-empty"))
+func TestIsEmptyDir_noConfigsAndTests(t *testing.T) {
+	val, err := IsEmptyDir(filepath.Join("testdata", "dir-empty"), "")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 	if !val {
 		t.Fatal("should be empty")
+	}
+}
+
+func TestIsEmptyDir_noConfigsButHasTests(t *testing.T) {
+	// The top directory has no configs, but it contains test files
+	val, err := IsEmptyDir(filepath.Join("testdata", "only-test-files"), "tests")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if val {
+		t.Fatal("should not be empty")
+	}
+}
+
+func TestIsEmptyDir_nestedTestsOnly(t *testing.T) {
+	// The top directory has no configs and no test files, but the nested
+	// directory has test files
+	val, err := IsEmptyDir(filepath.Join("testdata", "only-nested-test-files"), "tests")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if val {
+		t.Fatal("should not be empty")
 	}
 }

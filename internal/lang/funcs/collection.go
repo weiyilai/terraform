@@ -40,6 +40,7 @@ var LengthFunc = function.New(&function.Spec{
 		coll := args[0]
 		collTy := args[0].Type()
 		marks := coll.Marks()
+
 		switch {
 		case collTy == cty.DynamicPseudoType:
 			return cty.UnknownVal(cty.Number).WithMarks(marks), nil
@@ -222,14 +223,16 @@ var IndexFunc = function.New(&function.Spec{
 var LookupFunc = function.New(&function.Spec{
 	Params: []function.Parameter{
 		{
-			Name:        "inputMap",
-			Type:        cty.DynamicPseudoType,
-			AllowMarked: true,
+			Name:         "inputMap",
+			Type:         cty.DynamicPseudoType,
+			AllowMarked:  true,
+			AllowUnknown: true,
 		},
 		{
-			Name:        "key",
-			Type:        cty.String,
-			AllowMarked: true,
+			Name:         "key",
+			Type:         cty.String,
+			AllowMarked:  true,
+			AllowUnknown: true,
 		},
 	},
 	VarParam: &function.Parameter{
@@ -276,7 +279,7 @@ var LookupFunc = function.New(&function.Spec{
 		}
 	},
 	Impl: func(args []cty.Value, retType cty.Type) (ret cty.Value, err error) {
-		var defaultVal cty.Value
+		defaultVal := cty.NullVal(retType)
 		defaultValueSet := false
 
 		if len(args) == 3 {
@@ -297,11 +300,12 @@ var LookupFunc = function.New(&function.Spec{
 		if len(keyMarks) > 0 {
 			markses = append(markses, keyMarks)
 		}
-		lookupKey := keyVal.AsString()
 
-		if !mapVar.IsKnown() {
+		if !(mapVar.IsKnown() && keyVal.IsKnown()) {
 			return cty.UnknownVal(retType).WithMarks(markses...), nil
 		}
+
+		lookupKey := keyVal.AsString()
 
 		if mapVar.Type().IsObjectType() {
 			if mapVar.Type().HasAttribute(lookupKey) {
@@ -511,7 +515,7 @@ var SumFunc = function.New(&function.Spec{
 		ty := args[0].Type()
 
 		if !ty.IsListType() && !ty.IsSetType() && !ty.IsTupleType() {
-			return cty.NilVal, function.NewArgErrorf(0, fmt.Sprintf("argument must be list, set, or tuple. Received %s", ty.FriendlyName()))
+			return cty.NilVal, function.NewArgErrorf(0, "argument must be list, set, or tuple. Received %s", ty.FriendlyName())
 		}
 
 		if !args[0].IsWhollyKnown() {

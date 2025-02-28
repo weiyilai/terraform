@@ -78,6 +78,52 @@ func (p *Parser) LoadConfigDirWithTests(path string, testDirectory string) (*Mod
 	return mod, diags
 }
 
+func (p *Parser) LoadMockDataDir(dir string, useForPlanDefault bool, source hcl.Range) (*MockData, hcl.Diagnostics) {
+	var diags hcl.Diagnostics
+
+	infos, err := p.fs.ReadDir(dir)
+	if err != nil {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Failed to read mock data directory",
+			Detail:   fmt.Sprintf("Mock data directory %s does not exist or cannot be read.", dir),
+			Subject:  source.Ptr(),
+		})
+		return nil, diags
+	}
+
+	var files []string
+	for _, info := range infos {
+		if info.IsDir() {
+			// We only care about terraform configuration files.
+			continue
+		}
+
+		name := info.Name()
+		if !(strings.HasSuffix(name, ".tfmock.hcl") || strings.HasSuffix(name, ".tfmock.json")) {
+			continue
+		}
+
+		if IsIgnoredFile(name) {
+			continue
+		}
+
+		files = append(files, filepath.Join(dir, name))
+	}
+
+	var data *MockData
+	for _, file := range files {
+		current, currentDiags := p.LoadMockDataFile(file, useForPlanDefault)
+		diags = append(diags, currentDiags...)
+		if data != nil {
+			diags = append(diags, data.Merge(current, false)...)
+			continue
+		}
+		data = current
+	}
+	return data, diags
+}
+
 // ConfigDirFiles returns lists of the primary and override files configuration
 // files in the given directory.
 //
@@ -278,21 +324,21 @@ func IsIgnoredFile(name string) bool {
 }
 
 // IsEmptyDir returns true if the given filesystem path contains no Terraform
-// configuration files.
+// configuration or test files.
 //
 // Unlike the methods of the Parser type, this function always consults the
 // real filesystem, and thus it isn't appropriate to use when working with
 // configuration loaded from a plan file.
-func IsEmptyDir(path string) (bool, error) {
+func IsEmptyDir(path, testDir string) (bool, error) {
 	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
 		return true, nil
 	}
 
 	p := NewParser(nil)
-	fs, os, _, diags := p.dirFiles(path, "")
+	fs, os, tests, diags := p.dirFiles(path, testDir)
 	if diags.HasErrors() {
 		return false, diags
 	}
 
-	return len(fs) == 0 && len(os) == 0, nil
+	return len(fs) == 0 && len(os) == 0 && len(tests) == 0, nil
 }
